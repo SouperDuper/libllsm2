@@ -23,6 +23,35 @@
 #include "dsputils.h"
 #include "constants.h"
 
+static _CIG_TLS FP_TYPE* _bw_buf    = NULL;
+static _CIG_TLS int      _bw_buf_n  = 0;
+static _CIG_TLS int      _bw_last_n = 0;
+
+static _CIG_TLS FP_TYPE* _xw_buf   = NULL;
+static _CIG_TLS int      _xw_buf_n = 0;
+
+static _CIG_TLS FP_TYPE* _czt_re_buf = NULL;
+static _CIG_TLS FP_TYPE* _czt_im_buf = NULL;
+static _CIG_TLS int      _czt_out_n  = 0;
+
+static FP_TYPE* _iczt_re_buf = NULL;
+static int      _iczt_re_sz  = 0;
+
+static FP_TYPE* _get_blackman_tls(int n) {
+  if(n == _bw_last_n) return _bw_buf;
+  if(n > _bw_buf_n) {
+    free(_bw_buf);
+    _bw_buf   = (FP_TYPE*)malloc(n * sizeof(FP_TYPE));
+    _bw_buf_n = n;
+  }
+  const FP_TYPE a0 = 0.42, a1 = 0.50, a2 = 0.08;
+  const FP_TYPE c = 2.0 * M_PI / (n - 1);
+  for(int i = 0; i < n; i++)
+    _bw_buf[i] = a0 - a1 * cos(c * i) + a2 * cos(2.0 * c * i);
+  _bw_last_n = n;
+  return _bw_buf;
+}
+
 #include "filter-coef.h"
 
 static int get_chebyshev_filter(FP_TYPE cutoff, char* type,
@@ -144,28 +173,42 @@ void llsm_harmonic_peakpicking(FP_TYPE* spectrum, FP_TYPE* phase,
 
 void llsm_harmonic_czt(FP_TYPE* x, int nx, FP_TYPE f0, FP_TYPE fs,
   int nhar, FP_TYPE* dst_ampl, FP_TYPE* dst_phse) {
-  FP_TYPE* tmp = calloc(nx * 4, sizeof(FP_TYPE));
-  FP_TYPE* tmp_re = tmp;
-  FP_TYPE* tmp_im = tmp + nx * 2;
+  int n_out = nhar + 1;
+  if(n_out > _czt_out_n) {
+    free(_czt_re_buf); free(_czt_im_buf);
+    _czt_re_buf = (FP_TYPE*)calloc(n_out, sizeof(FP_TYPE));
+    _czt_im_buf = (FP_TYPE*)calloc(n_out, sizeof(FP_TYPE));
+    _czt_out_n  = n_out;
+  } else {
+    memset(_czt_re_buf, 0, n_out * sizeof(FP_TYPE));
+    memset(_czt_im_buf, 0, n_out * sizeof(FP_TYPE));
+  }
+  FP_TYPE* tmp_re = _czt_re_buf;
+  FP_TYPE* tmp_im = _czt_im_buf;
 
   int shift = nx / 2;
-  FP_TYPE* w = blackman(nx);
+  FP_TYPE* w = _get_blackman_tls(nx);
   FP_TYPE winsum = sumfp(w, nx);
 
-  for(int i = 0; i < nx; i ++) w[i] *= x[i];
-  czt(w, NULL, tmp_re, tmp_im, 2.0 * M_PI * f0 / fs, nx);
+  if(nx > _xw_buf_n) {
+    free(_xw_buf);
+    _xw_buf   = (FP_TYPE*)malloc(nx * sizeof(FP_TYPE));
+    _xw_buf_n = nx;
+  }
+  for(int i = 0; i < nx; i++) _xw_buf[i] = w[i] * x[i];
+
+  cig_czt_mn(_xw_buf, NULL, tmp_re, tmp_im, 2.0 * M_PI * f0 / fs, nx, n_out);
+
   for(int i = 0; i < nhar; i ++) {
     FP_TYPE ishift = shift * 2.0 * M_PI * f0 / fs * (i + 1.0);
     FP_TYPE s_re = cos(ishift);
     FP_TYPE s_im = sin(ishift);
     FP_TYPE dst_re = tmp_re[i + 1] * s_re - tmp_im[i + 1] * s_im;
     FP_TYPE dst_im = tmp_re[i + 1] * s_im + tmp_im[i + 1] * s_re;
-    dst_ampl[i] = sqrt (dst_re * dst_re + dst_im * dst_im) * 2.0 / winsum;
+    dst_ampl[i] = sqrt(dst_re * dst_re + dst_im * dst_im) * 2.0 / winsum;
     dst_phse[i] = atan2(dst_im, dst_re);
   }
 
-  free(tmp);
-  free(w);
 }
 
 static int f0_to_nhar(FP_TYPE f0, FP_TYPE fs) {
@@ -212,6 +255,9 @@ void llsm_harmonic_analysis(FP_TYPE* x, int nx, FP_TYPE fs, FP_TYPE* f0,
     free2d(spec_magn, nvfrm);
     free2d(spec_phse, nvfrm);
   } else {
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic)
+#endif
     for(int i = 0; i < nvfrm; i ++) {
       int idx = index_vfrm[i];
       FP_TYPE* xfrm = fetch_frame(x, nx, center[i], winsize[i]);
@@ -338,7 +384,14 @@ FP_TYPE* llsm_synthesize_harmonic_frame(FP_TYPE* ampl, FP_TYPE* phse, int nhar,
 FP_TYPE* llsm_synthesize_harmonic_frame_iczt(FP_TYPE* ampl, FP_TYPE* phse,
   int nhar, FP_TYPE f0, int nx) {
   FP_TYPE* yr = malloc(nx * sizeof(FP_TYPE));
-  FP_TYPE* re = calloc(max(nhar + 1, nx) * 2, sizeof(FP_TYPE));
+  int need = max(nhar + 1, nx) * 2;
+  if(need > _iczt_re_sz) {
+    free(_iczt_re_buf);
+    _iczt_re_buf = (FP_TYPE*)malloc(need * sizeof(FP_TYPE));
+    _iczt_re_sz  = need;
+  }
+  memset(_iczt_re_buf, 0, need * sizeof(FP_TYPE));
+  FP_TYPE* re = _iczt_re_buf;
   FP_TYPE* im = re + max(nhar + 1, nx);
   FP_TYPE omega0 = 2.0 * M_PI * f0;
   for(int i = 0; i < nhar; i ++) {
@@ -346,7 +399,6 @@ FP_TYPE* llsm_synthesize_harmonic_frame_iczt(FP_TYPE* ampl, FP_TYPE* phse,
     im[i + 1] = ampl[i] * sin_2(phse[i] - nx / 2 * (1.0 + i) * omega0) * nx;
   }
   iczt(re, im, yr, NULL, omega0, nx);
-  free(re);
   return yr;
 }
 

@@ -45,6 +45,8 @@ static int llsm_layer1to0_check_integrity(llsm_container* conf) {
   return 1;
 }
 
+static llsm_cached_glottal_model* g_cgm_cache = NULL;
+
 static FP_TYPE* llsm_analyze_rd(llsm_chunk* src) {
   int nfrm = *((int*)llsm_container_get(src -> conf, LLSM_CONF_NFRM));
   FP_TYPE thop = *((FP_TYPE*)llsm_container_get(src -> conf, LLSM_CONF_THOP));
@@ -52,10 +54,12 @@ static FP_TYPE* llsm_analyze_rd(llsm_chunk* src) {
     LLSM_CONF_LIPRADIUS));
 
   int ncandidate = 64;
-  FP_TYPE* rd_list = linspace(0.02, 3.0, ncandidate);
-  llsm_cached_glottal_model* cgm = llsm_create_cached_glottal_model(
-    rd_list, ncandidate, 80);
-  free(rd_list);
+  if(g_cgm_cache == NULL) {
+    FP_TYPE* rd_list = linspace(0.02, 3.0, ncandidate);
+    g_cgm_cache = llsm_create_cached_glottal_model(rd_list, ncandidate, 80);
+    free(rd_list);
+  }
+  llsm_cached_glottal_model* cgm = g_cgm_cache;
   FP_TYPE* rd = calloc(nfrm, sizeof(FP_TYPE));
   for(int i = 0; i < nfrm; i ++) {
     FP_TYPE f0 = *((FP_TYPE*)llsm_container_get(src -> frames[i],
@@ -69,7 +73,6 @@ static FP_TYPE* llsm_analyze_rd(llsm_chunk* src) {
     rd[i] = llsm_spectral_glottal_fitting(ampl, nhar, cgm);
     free(ampl);
   }
-  llsm_delete_cached_glottal_model(cgm);
 
   FP_TYPE* rd_cont = interp_in_blank(rd, nfrm, 0);
   FP_TYPE* rd_smooth = llsm_smoothing_filter(rd_cont, nfrm,
@@ -138,10 +141,15 @@ void llsm_chunk_tolayer1(llsm_chunk* dst, int nfft) {
 
   FP_TYPE* rd = llsm_analyze_rd(dst);
   for(int i = 0; i < nfrm; i ++) {
-    FP_TYPE f0 = *((FP_TYPE*)llsm_container_get(dst -> frames[i],
-      LLSM_FRAME_F0));
     llsm_container_attach(dst -> frames[i], LLSM_FRAME_RD,
       llsm_create_fp(rd[i]), llsm_delete_fp, llsm_copy_fp);
+  }
+#ifdef _OPENMP
+  #pragma omp parallel for schedule(dynamic)
+#endif
+  for(int i = 0; i < nfrm; i ++) {
+    FP_TYPE f0 = *((FP_TYPE*)llsm_container_get(dst -> frames[i],
+      LLSM_FRAME_F0));
     if(f0 == 0) continue;
     llsm_frame_tolayer1(dst -> frames[i], lip_radius, fnyq, nfft);
   }
